@@ -176,7 +176,12 @@ def _cookie_file(workdir: Path) -> str | None:
 
 def download_video(url: str, workdir: Path, prefer_low_res: bool = True) -> Downloaded:
     outtmpl = str(workdir / "video.%(ext)s")
-    fmt = "bv*[height<=720]+ba/b[height<=720]/best" if prefer_low_res else "bv*+ba/b"
+    # Each "/" is a fallback. Mobile clients sometimes only return single-file streams,
+    # so we end with `best` to always have something that resolves.
+    if prefer_low_res:
+        fmt = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b/best[height<=720]/best"
+    else:
+        fmt = "bv*+ba/b/best"
     base_opts: dict = {
         "outtmpl": outtmpl,
         "format": fmt,
