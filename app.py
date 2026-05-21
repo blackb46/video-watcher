@@ -176,10 +176,10 @@ def _cookie_file(workdir: Path) -> str | None:
 
 def download_video(url: str, workdir: Path, prefer_low_res: bool = True) -> Downloaded:
     outtmpl = str(workdir / "video.%(ext)s")
-    # Each "/" is a fallback. Mobile clients sometimes only return single-file streams,
-    # so we end with `best` to always have something that resolves.
+    # Each "/" is a fallback. YouTube usually serves separate video+audio streams;
+    # bv*+ba handles that. `b` and `best` cover combined-stream single files.
     if prefer_low_res:
-        fmt = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b/best[height<=720]/best"
+        fmt = "bv*[height<=720]+ba/b[height<=720]/bv*+ba/best[height<=720]/b/best"
     else:
         fmt = "bv*+ba/b/best"
     base_opts: dict = {
@@ -207,8 +207,9 @@ def download_video(url: str, workdir: Path, prefer_low_res: bool = True) -> Down
     if cookie_path:
         base_opts["cookiefile"] = cookie_path
 
-    # Probe metadata first with each client until one returns a non-empty format list.
-    # Then attempt download with that client + an aggressive format fallback.
+    # Probe metadata with each client until one returns a non-empty format list.
+    # `process=False` skips format selection so we see the raw manifest. (Plain
+    # `download=False` still applies the format string and would fail the same way.)
     client_attempts = [None, ["mweb"], ["android"], ["ios"], ["tv_embedded"], ["web"]]
 
     info = None
@@ -216,13 +217,14 @@ def download_video(url: str, workdir: Path, prefer_low_res: bool = True) -> Down
     chosen_clients: list[str] | None = None
 
     for clients in client_attempts:
-        opts = dict(base_opts)
+        probe_opts = dict(base_opts)
+        probe_opts.pop("format", None)  # ensure no format constraint during probe
         if clients is not None:
-            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+            probe_opts["extractor_args"] = {"youtube": {"player_client": clients}}
         label = "default" if clients is None else "+".join(clients)
         try:
-            with yt_dlp.YoutubeDL(opts) as probe:
-                meta = probe.extract_info(url, download=False)
+            with yt_dlp.YoutubeDL(probe_opts) as probe:
+                meta = probe.extract_info(url, download=False, process=False)
             formats = meta.get("formats") or []
             probe_log.append(f"{label}: {len(formats)} formats")
             if formats:
