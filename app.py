@@ -164,10 +164,20 @@ class Downloaded:
     info: dict
 
 
+def _cookie_file(workdir: Path) -> str | None:
+    """If a YT_COOKIES secret is set (Netscape format), write it to a temp file."""
+    raw = secret("YT_COOKIES")
+    if not raw:
+        return None
+    p = workdir / "cookies.txt"
+    p.write_text(raw, encoding="utf-8")
+    return str(p)
+
+
 def download_video(url: str, workdir: Path, prefer_low_res: bool = True) -> Downloaded:
     outtmpl = str(workdir / "video.%(ext)s")
     fmt = "bv*[height<=720]+ba/b[height<=720]/best" if prefer_low_res else "bv*+ba/b"
-    ydl_opts = {
+    base_opts: dict = {
         "outtmpl": outtmpl,
         "format": fmt,
         "merge_output_format": "mp4",
@@ -178,9 +188,55 @@ def download_video(url: str, workdir: Path, prefer_low_res: bool = True) -> Down
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        # Looks more like a real browser; reduces 403s on shared cloud egress.
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/127.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    cookie_path = _cookie_file(workdir)
+    if cookie_path:
+        base_opts["cookiefile"] = cookie_path
+
+    # YouTube serves different clients with different access; rotating through them
+    # is the standard workaround for "HTTP 403 Forbidden" on cloud IPs.
+    client_attempts = [
+        ["mweb"],
+        ["android"],
+        ["ios"],
+        ["tv_embedded"],
+        ["web"],
+    ]
+
+    last_err: Exception | None = None
+    info = None
+    for clients in client_attempts:
+        opts = dict(base_opts)
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            break
+        except Exception as e:  # noqa: BLE001 — yt-dlp raises a few different types
+            last_err = e
+            # Wipe partial files between attempts so the next try writes cleanly.
+            for leftover in workdir.glob("video*"):
+                leftover.unlink(missing_ok=True)
+            continue
+
+    if info is None:
+        msg = str(last_err) if last_err else "unknown error"
+        hint = (
+            "\n\nYouTube is blocking downloads from this server's IP. Options:\n"
+            "• Add cookies: export your YouTube cookies (Netscape format) and "
+            "paste the file contents into a Streamlit secret named YT_COOKIES.\n"
+            "• Or: download the video locally and use the **Upload file** tab."
+        )
+        raise RuntimeError(f"yt-dlp failed across all clients: {msg}{hint}")
 
     video_path = None
     for p in workdir.iterdir():
