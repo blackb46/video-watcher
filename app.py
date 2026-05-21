@@ -207,41 +207,63 @@ def download_video(url: str, workdir: Path, prefer_low_res: bool = True) -> Down
     if cookie_path:
         base_opts["cookiefile"] = cookie_path
 
-    # YouTube serves different clients with different access; rotating through them
-    # is the standard workaround for "HTTP 403 Forbidden" on cloud IPs.
-    client_attempts = [
-        ["mweb"],
-        ["android"],
-        ["ios"],
-        ["tv_embedded"],
-        ["web"],
-    ]
+    # Probe metadata first with each client until one returns a non-empty format list.
+    # Then attempt download with that client + an aggressive format fallback.
+    client_attempts = [None, ["mweb"], ["android"], ["ios"], ["tv_embedded"], ["web"]]
 
-    last_err: Exception | None = None
     info = None
+    probe_log: list[str] = []
+    chosen_clients: list[str] | None = None
+
     for clients in client_attempts:
         opts = dict(base_opts)
-        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        if clients is not None:
+            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        label = "default" if clients is None else "+".join(clients)
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-            break
-        except Exception as e:  # noqa: BLE001 — yt-dlp raises a few different types
-            last_err = e
-            # Wipe partial files between attempts so the next try writes cleanly.
-            for leftover in workdir.glob("video*"):
-                leftover.unlink(missing_ok=True)
+            with yt_dlp.YoutubeDL(opts) as probe:
+                meta = probe.extract_info(url, download=False)
+            formats = meta.get("formats") or []
+            probe_log.append(f"{label}: {len(formats)} formats")
+            if formats:
+                info = meta
+                chosen_clients = clients
+                break
+        except Exception as e:
+            probe_log.append(f"{label}: {type(e).__name__}: {e}")
             continue
 
     if info is None:
-        msg = str(last_err) if last_err else "unknown error"
         hint = (
-            "\n\nYouTube is blocking downloads from this server's IP. Options:\n"
-            "• Add cookies: export your YouTube cookies (Netscape format) and "
-            "paste the file contents into a Streamlit secret named YT_COOKIES.\n"
-            "• Or: download the video locally and use the **Upload file** tab."
+            "\n\nNo client returned any downloadable formats. Likely causes:\n"
+            "• Video is members-only, age-restricted, region-locked, or a live stream.\n"
+            "• Your cookies don't include access to this video (try a different YouTube account).\n"
+            "• Or: download the video locally and use the **Upload file** tab.\n\n"
+            "Probe log:\n  " + "\n  ".join(probe_log)
         )
-        raise RuntimeError(f"yt-dlp failed across all clients: {msg}{hint}")
+        raise RuntimeError(f"yt-dlp could not access this video.{hint}")
+
+    # Build a download-time format string. Start with the user preference, then add
+    # a guaranteed-resolvable last resort: the highest-numbered format_id we just saw.
+    fmt_ids = [f.get("format_id") for f in info["formats"] if f.get("format_id")]
+    last_resort = fmt_ids[-1] if fmt_ids else "best"
+    chained_fmt = f"{fmt}/{last_resort}"
+
+    dl_opts = dict(base_opts)
+    if chosen_clients is not None:
+        dl_opts["extractor_args"] = {"youtube": {"player_client": chosen_clients}}
+    dl_opts["format"] = chained_fmt
+
+    try:
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"yt-dlp download failed despite finding {len(info.get('formats', []))} formats.\n"
+            f"Tried format string: {chained_fmt!r}\n"
+            f"Error: {e}\n\n"
+            f"Fallback: download the video locally and use the **Upload file** tab."
+        ) from e
 
     video_path = None
     for p in workdir.iterdir():
