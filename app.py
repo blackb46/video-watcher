@@ -50,9 +50,9 @@ load_dotenv()
 
 # Model menus. Display label -> API model id.
 CLAUDE_MODELS = {
-    "Claude Sonnet 4 (balanced — recommended)": "claude-sonnet-4-20250514",
+    "Claude Sonnet 5 (balanced — recommended)": "claude-sonnet-5",
     "Claude Haiku 4.5 (fast & cheap)": "claude-haiku-4-5-20251001",
-    "Claude Opus 4.x (deepest analysis)": "claude-opus-4-20250514",
+    "Claude Opus 4.8 (deepest analysis)": "claude-opus-4-8",
 }
 
 # Whisper providers. Groq's whisper-large-v3-turbo is ~10x faster than OpenAI for the same quality tier.
