@@ -507,6 +507,21 @@ def transcript_plain(transcript: str) -> str:
     return "\n".join(re.sub(r"^\[\d\d:\d\d:\d\d\]\s*", "", ln) for ln in transcript.splitlines())
 
 
+def markdown_to_plain(md: str) -> str:
+    """Strip common markdown syntax so the summary can be downloaded as clean plain text."""
+    text = md
+    text = re.sub(r"```[^\n]*\n?", "", text)              # code fence markers
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)  # headers
+    text = re.sub(r"\*\*\*(.+?)\*\*\*", r"\1", text)       # bold+italic
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)           # bold
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)  # italic
+    text = re.sub(r"__(.+?)__", r"\1", text)               # bold (underscore)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)  # links
+    text = re.sub(r"^\s*[-*+]\s+", "\u2022 ", text, flags=re.MULTILINE)  # bullets
+    text = re.sub(r"\n{3,}", "\n\n", text)                 # collapse blank runs
+    return text.strip()
+
+
 # ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
@@ -609,8 +624,29 @@ with tab_file:
                         disabled=uploaded is None, key="go_file")
 
 
-# ----- Pipeline executor -------------------------------------------------------
-def run_pipeline(
+# ----- Result cache ---------------------------------------------------------
+# Streamlit reruns the whole script on every widget interaction, including
+# download-button clicks. Without caching, that rerun would fall through to
+# "no button was just clicked" and the results (and this section's downloads)
+# would vanish — forcing a full re-download / re-transcribe / re-summarize to
+# get them back. Stashing the finished pipeline output in session_state and
+# rendering it unconditionally on every rerun fixes that.
+if "vw_result" not in st.session_state:
+    st.session_state.vw_result = None
+if "vw_workdir" not in st.session_state:
+    st.session_state.vw_workdir = None
+
+
+def _cleanup_workdir() -> None:
+    """Remove the previous run's temp dir (keyframe jpgs, audio, video) before starting a new one."""
+    old = st.session_state.get("vw_workdir")
+    if old and Path(old).exists():
+        shutil.rmtree(old, ignore_errors=True)
+    st.session_state.vw_workdir = None
+
+
+# ----- Pipeline: compute only (no rendering) --------------------------------
+def compute_pipeline(
     video_path: Path,
     workdir: Path,
     sub_path: Path | None,
@@ -618,10 +654,10 @@ def run_pipeline(
     author: str,
     source_url: str | None,
     chapters: list[dict] | None,
-):
+) -> dict | None:
     if not secret("ANTHROPIC_API_KEY"):
         st.error("Anthropic API key required. Add it in the sidebar or secrets.")
-        return
+        return None
 
     start = parse_ts(start_str)
     end = parse_ts(end_str)
@@ -638,18 +674,6 @@ def run_pipeline(
         timings["clip"] = time.time() - t0
 
     duration = ffprobe_duration(video_path)
-
-    # Header metrics
-    src_label = "URL" if source_url else "Upload"
-    kpi = f"""
-        <div class="vw-kpi">
-          <div><small>Title</small><br/><b>{title[:60]}</b></div>
-          <div><small>Duration</small><br/><b>{fmt_ts(duration)}</b></div>
-          <div><small>Source</small><br/><b>{src_label}</b></div>
-          <div><small>Model</small><br/><b>{claude_label.split(' (')[0]}</b></div>
-        </div>
-    """
-    st.markdown(kpi, unsafe_allow_html=True)
 
     progress = st.progress(0.0, text="Starting…")
 
@@ -679,7 +703,7 @@ def run_pipeline(
             transcript_source = f"{whisper_provider} · {whisper_model}"
         except Exception as e:
             st.error(f"Transcription failed: {e}")
-            return
+            return None
     timings["transcript"] = time.time() - t0
 
     # 3. Claude
@@ -698,44 +722,96 @@ def run_pipeline(
         )
     except Exception as e:
         st.error(f"Claude call failed: {e}")
-        return
+        return None
     timings["claude"] = time.time() - t0
     progress.progress(1.0, text="Done.")
     progress.empty()
 
-    # ----- Tabs ---------------------------------------------------------
+    return {
+        "title": title,
+        "src_label": "URL" if source_url else "Upload",
+        "claude_label": claude_label,
+        "duration": duration,
+        "result_md": result_md,
+        "transcript": transcript,
+        "transcript_source": transcript_source,
+        "keyframes": [(ts, str(p)) for ts, p in keyframes],
+        "chapters": chapters,
+        "yt_id": yt_id,
+        "timings": timings,
+        "settings": {
+            "quality": quality,
+            "claude_model": claude_model,
+            "whisper": f"{whisper_provider}/{whisper_model}",
+            "keyframes": len(keyframes),
+            "language_hint": language_hint or None,
+            "section": [start, end],
+            "low_res": low_res,
+        },
+    }
+
+
+# ----- Rendering: draws from cached state, runs on every rerun --------------
+def render_results(result: dict) -> None:
+    title = result["title"]
+    out_name = re.sub(r"[^A-Za-z0-9_-]+", "_", title)[:60] or "summary"
+
+    kpi = f"""
+        <div class="vw-kpi">
+          <div><small>Title</small><br/><b>{title[:60]}</b></div>
+          <div><small>Duration</small><br/><b>{fmt_ts(result["duration"])}</b></div>
+          <div><small>Source</small><br/><b>{result["src_label"]}</b></div>
+          <div><small>Model</small><br/><b>{result["claude_label"].split(' (')[0]}</b></div>
+        </div>
+    """
+    st.markdown(kpi, unsafe_allow_html=True)
+
     tab_sum, tab_tx, tab_kf, tab_ch, tab_dbg = st.tabs(
         ["📝 Summary", "🗒️ Transcript", "🖼️ Keyframes", "📑 Chapters", "⚙️ Debug"]
     )
 
     with tab_sum:
-        st.markdown(result_md)
-        out_name = re.sub(r"[^A-Za-z0-9_-]+", "_", title)[:60] or "summary"
-        st.download_button(
-            "Download summary (.md)",
-            data=result_md.encode("utf-8"),
-            file_name=f"{out_name}.md",
-            mime="text/markdown",
-        )
+        st.markdown(result["result_md"])
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "Download summary (.md)",
+                data=result["result_md"].encode("utf-8"),
+                file_name=f"{out_name}.md",
+                mime="text/markdown",
+                use_container_width=True,
+                key="dl_summary_md",
+            )
+        with c2:
+            st.download_button(
+                "Download summary (.txt)",
+                data=markdown_to_plain(result["result_md"]).encode("utf-8"),
+                file_name=f"{out_name}.txt",
+                mime="text/plain",
+                use_container_width=True,
+                key="dl_summary_txt",
+            )
 
     with tab_tx:
-        st.caption(f"Source: **{transcript_source}** · {len(transcript.splitlines())} segments")
+        transcript = result["transcript"]
+        st.caption(f"Source: **{result['transcript_source']}** · {len(transcript.splitlines())} segments")
         st.text_area("Transcript", value=transcript, height=400, label_visibility="collapsed")
         c1, c2, c3 = st.columns(3)
         with c1:
             st.download_button("Download .txt", transcript_plain(transcript).encode(),
                                file_name=f"{out_name}.txt", mime="text/plain",
-                               use_container_width=True)
+                               use_container_width=True, key="dl_tx_plain")
         with c2:
             st.download_button("Download timestamped .txt", transcript.encode(),
                                file_name=f"{out_name}_ts.txt", mime="text/plain",
-                               use_container_width=True)
+                               use_container_width=True, key="dl_tx_ts")
         with c3:
             st.download_button("Download .srt", transcript_to_srt(transcript).encode(),
                                file_name=f"{out_name}.srt", mime="application/x-subrip",
-                               use_container_width=True)
+                               use_container_width=True, key="dl_tx_srt")
 
     with tab_kf:
+        keyframes = result["keyframes"]
         if not keyframes:
             st.info("No keyframes extracted.")
         else:
@@ -743,12 +819,14 @@ def run_pipeline(
             for i, (ts, p) in enumerate(keyframes):
                 with cols[i % 4]:
                     caption = fmt_ts(ts)
-                    if yt_id:
-                        caption = f"[{caption}](https://youtu.be/{yt_id}?t={int(ts)})"
-                    st.image(str(p), use_container_width=True)
+                    if result["yt_id"]:
+                        caption = f"[{caption}](https://youtu.be/{result['yt_id']}?t={int(ts)})"
+                    if Path(p).exists():
+                        st.image(p, use_container_width=True)
                     st.markdown(caption)
 
     with tab_ch:
+        chapters = result["chapters"]
         if chapters:
             for ch in chapters:
                 s = fmt_ts(ch.get("start_time", 0))
@@ -759,55 +837,55 @@ def run_pipeline(
 
     with tab_dbg:
         st.markdown("**Stage timings (seconds)**")
-        st.json({k: round(v, 2) for k, v in timings.items()})
+        st.json({k: round(v, 2) for k, v in result["timings"].items()})
         st.markdown("**Settings used**")
-        st.json({
-            "quality": quality,
-            "claude_model": claude_model,
-            "whisper": f"{whisper_provider}/{whisper_model}",
-            "keyframes": len(keyframes),
-            "language_hint": language_hint or None,
-            "section": [start, end],
-            "low_res": low_res,
-        })
+        st.json(result["settings"])
 
 
 # ----- Dispatch ----------------------------------------------------------------
+# The pipeline only runs when Analyze is actually clicked. Any other rerun
+# (download-button clicks, sidebar tweaks, etc.) just re-renders the cached
+# result below — it never re-downloads, re-transcribes, or re-calls Claude.
 
 if go_url and url:
-    with tempfile.TemporaryDirectory() as td:
-        workdir = Path(td)
-        try:
-            with st.status("Downloading with yt-dlp…", expanded=False):
-                dl = download_video(url, workdir, prefer_low_res=low_res)
-            info = dl.info or {}
-            run_pipeline(
-                video_path=dl.video_path,
-                workdir=workdir,
-                sub_path=dl.sub_path,
-                title=info.get("title") or url,
-                author=info.get("uploader") or info.get("channel") or "",
-                source_url=url,
-                chapters=info.get("chapters") or [],
-            )
-        except Exception as e:
-            st.exception(e)
+    _cleanup_workdir()
+    workdir = Path(tempfile.mkdtemp(prefix="vw_"))
+    st.session_state.vw_workdir = str(workdir)
+    try:
+        with st.status("Downloading with yt-dlp…", expanded=False):
+            dl = download_video(url, workdir, prefer_low_res=low_res)
+        info = dl.info or {}
+        st.session_state.vw_result = compute_pipeline(
+            video_path=dl.video_path,
+            workdir=workdir,
+            sub_path=dl.sub_path,
+            title=info.get("title") or url,
+            author=info.get("uploader") or info.get("channel") or "",
+            source_url=url,
+            chapters=info.get("chapters") or [],
+        )
+    except Exception as e:
+        st.exception(e)
 
 if go_file and uploaded is not None:
-    with tempfile.TemporaryDirectory() as td:
-        workdir = Path(td)
-        suffix = Path(uploaded.name).suffix or ".mp4"
-        video_path = workdir / f"upload{suffix}"
-        video_path.write_bytes(uploaded.getbuffer())
-        try:
-            run_pipeline(
-                video_path=video_path,
-                workdir=workdir,
-                sub_path=None,
-                title=uploaded.name,
-                author="",
-                source_url=None,
-                chapters=None,
-            )
-        except Exception as e:
-            st.exception(e)
+    _cleanup_workdir()
+    workdir = Path(tempfile.mkdtemp(prefix="vw_"))
+    st.session_state.vw_workdir = str(workdir)
+    suffix = Path(uploaded.name).suffix or ".mp4"
+    video_path = workdir / f"upload{suffix}"
+    video_path.write_bytes(uploaded.getbuffer())
+    try:
+        st.session_state.vw_result = compute_pipeline(
+            video_path=video_path,
+            workdir=workdir,
+            sub_path=None,
+            title=uploaded.name,
+            author="",
+            source_url=None,
+            chapters=None,
+        )
+    except Exception as e:
+        st.exception(e)
+
+if st.session_state.vw_result:
+    render_results(st.session_state.vw_result)
