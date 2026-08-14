@@ -590,13 +590,23 @@ with st.sidebar:
                             help="Faster downloads. Disable for high-detail visual analysis.")
 
     with st.expander("API keys"):
-        st.caption("Pulled from secrets/env automatically. Override here for one session.")
-        ak = st.text_input("Anthropic", value=secret("ANTHROPIC_API_KEY"), type="password")
-        ok = st.text_input("OpenAI",    value=secret("OPENAI_API_KEY"),    type="password")
-        gk = st.text_input("Groq",      value=secret("GROQ_API_KEY"),      type="password")
-        if ak: os.environ["ANTHROPIC_API_KEY"] = ak
-        if ok: os.environ["OPENAI_API_KEY"]    = ok
-        if gk: os.environ["GROQ_API_KEY"]      = gk
+        st.caption(
+            "Pulled from secrets/env automatically — configured keys are never shown here. "
+            "Only fill a field below to override it for this session."
+        )
+
+        def _key_row(label: str, name: str) -> None:
+            configured = "✓ configured" if secret(name) else "not set"
+            val = st.text_input(
+                label, value="", type="password",
+                placeholder=configured, key=f"override_{name}",
+            )
+            if val:
+                os.environ[name] = val
+
+        _key_row("Anthropic", "ANTHROPIC_API_KEY")
+        _key_row("OpenAI", "OPENAI_API_KEY")
+        _key_row("Groq", "GROQ_API_KEY")
 
 claude_model = CLAUDE_MODELS[claude_label]
 whisper_provider, whisper_model = WHISPER_PROVIDERS[whisper_label]
