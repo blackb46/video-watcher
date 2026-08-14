@@ -46,7 +46,10 @@ except ImportError:  # pragma: no cover
 # Config
 # ---------------------------------------------------------------------------
 
-load_dotenv()
+# override=True: a local .env should always win over a stale OS-level env var
+# (e.g. a system OPENAI_API_KEY set for other tools) — otherwise editing .env
+# silently has no effect for as long as that variable is already set.
+load_dotenv(override=True)
 
 # Model menus. Display label -> API model id.
 CLAUDE_MODELS = {
