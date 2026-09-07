@@ -249,8 +249,16 @@ def download_video(url: str, workdir: Path, prefer_low_res: bool = True) -> Down
         raise RuntimeError(f"yt-dlp could not access this video.{hint}")
 
     # Build a download-time format string. Start with the user preference, then add
-    # a guaranteed-resolvable last resort: the highest-numbered format_id we just saw.
-    fmt_ids = [f.get("format_id") for f in info["formats"] if f.get("format_id")]
+    # a guaranteed-resolvable last resort: the highest-numbered *real* format_id we
+    # just saw. Storyboard formats ("sb0", "sb1"...) are picture-grid previews, not
+    # video — they sort last in YouTube's format list and always fail if picked.
+    fmt_ids = [
+        f.get("format_id") for f in info["formats"]
+        if f.get("format_id")
+        and not str(f.get("format_id", "")).startswith("sb")
+        and (f.get("format_note") or "").lower() != "storyboard"
+        and f.get("ext") != "mhtml"
+    ]
     last_resort = fmt_ids[-1] if fmt_ids else "best"
     chained_fmt = f"{fmt}/{last_resort}"
 
